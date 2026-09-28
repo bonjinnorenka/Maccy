@@ -1,11 +1,14 @@
 import AppKit
 import Defaults
+import ImageIO
 import Sauce
 import SwiftData
 import Vision
 
 @Model
 class HistoryItem {
+  static let maximumPinnedItems = 10
+
   static var supportedPins: Set<String> {
     // "a" reserved for select all
     // "q" reserved for quit
@@ -44,6 +47,9 @@ class HistoryItem {
 
   @MainActor
   static func availablePins(in items: [HistoryItem]) -> [String] {
+    guard items.count < maximumPinnedItems else {
+      return []
+    }
     let assignedPins = Set(items.compactMap(\.pin))
     return Array(supportedPins.subtracting(assignedPins))
   }
@@ -74,8 +80,6 @@ class HistoryItem {
   @Relationship(deleteRule: .cascade, inverse: \HistoryItemContent.item)
   var contents: [HistoryItemContent] = []
 
-  @Transient private var cachedDecodedImage: NSImage?
-
   init(contents: [HistoryItemContent] = []) {
     self.firstCopiedAt = firstCopiedAt
     self.lastCopiedAt = lastCopiedAt
@@ -88,15 +92,12 @@ class HistoryItem {
         !Self.transientTypes.contains(content.type)
       }
       .allSatisfy { content in
-        contents.contains(where: { $0.type == content.type && $0.value == content.value })
+        contents.contains(where: { $0.hasSamePayload(as: content) })
       }
   }
 
   func generateTitle() -> String {
-    guard image == nil else {
-      Task {
-        self.performTextRecognition()
-      }
+    guard !hasImage else {
       return ""
     }
 
@@ -166,16 +167,85 @@ class HistoryItem {
     return data
   }
 
+  var hasImage: Bool { !imageContents.isEmpty || universalClipboardImage }
+
   var image: NSImage? {
-    if let img = cachedDecodedImage {
-      return img
-    }
     guard let data = imageData else {
       return nil
     }
 
-    cachedDecodedImage = NSImage(data: data)
-    return cachedDecodedImage
+    return NSImage(data: data)
+  }
+
+  var imagePixelSize: NSSize? {
+    if let content = imageContents.first,
+       let width = content.pixelWidth,
+       let height = content.pixelHeight {
+      return NSSize(width: width, height: height)
+    }
+
+    guard let data = imageData,
+          let source = CGImageSourceCreateWithData(data as CFData, [
+            kCGImageSourceShouldCache: false
+          ] as CFDictionary),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+          let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue else {
+      return nil
+    }
+
+    return NSSize(width: width, height: height)
+  }
+
+  var thumbnailImage: NSImage? {
+    thumbnailImage(maximumSize: NSSize(width: 340, height: 40))
+  }
+
+  func thumbnailImage(maximumSize: NSSize) -> NSImage? {
+    guard let content = imageContents.first else {
+      return nil
+    }
+
+    if let identifier = content.externalPayloadIdentifier {
+      let logicalSize = logicalImageSize(for: content)
+      return PayloadStore.shared.thumbnail(
+        identifier: identifier,
+        logicalImageSize: logicalSize,
+        maximumSize: maximumSize
+      )
+    }
+
+    return content.data.flatMap(Self.makeThumbnailImage(from:))
+  }
+
+  func previewImage(maximumPixelSize: Int) -> NSImage? {
+    guard let content = imageContents.first else {
+      return nil
+    }
+
+    if let identifier = content.externalPayloadIdentifier {
+      return PayloadStore.shared.previewImage(
+        identifier: identifier,
+        type: content.type,
+        logicalImageSize: logicalImageSize(for: content),
+        maximumPixelSize: maximumPixelSize
+      )
+    }
+
+    guard let data = content.data,
+          let source = CGImageSourceCreateWithData(data as CFData, [
+            kCGImageSourceShouldCache: false
+          ] as CFDictionary),
+          let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+            kCGImageSourceShouldCache: false
+          ] as CFDictionary) else {
+      return nil
+    }
+
+    return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
   }
 
   var rtfData: Data? { contentData([.rtf]) }
@@ -185,11 +255,6 @@ class HistoryItem {
     }
 
     return NSAttributedString(rtf: data, documentAttributes: nil)
-  }
-
-  func clearDecodedImageCache() {
-    cachedDecodedImage?.recache()
-    cachedDecodedImage = nil
   }
 
   var text: String? {
@@ -222,40 +287,67 @@ class HistoryItem {
       return types.contains(NSPasteboard.PasteboardType(content.type))
     })
 
-    return content?.value
+    return content?.data
   }
 
   private func allContentData(_ types: [NSPasteboard.PasteboardType]) -> [Data] {
     return contents
       .filter { types.contains(NSPasteboard.PasteboardType($0.type)) }
-      .compactMap { $0.value }
+      .compactMap(\.data)
   }
 
-  private func performTextRecognition() {
-    guard let cgImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-      return
+  @MainActor
+  func recognizeTextOnDemand() async -> String {
+    guard hasImage, let data = imageData else {
+      return ""
     }
 
-    let requestHandler = VNImageRequestHandler(cgImage: cgImage)
-    let request = VNRecognizeTextRequest(completionHandler: recognizeTextHandler)
-    request.recognitionLevel = .fast
+    let recognizedText = await Task.detached(priority: .userInitiated) {
+      let request = VNRecognizeTextRequest()
+      request.recognitionLevel = .fast
 
-    do {
-      try requestHandler.perform([request])
-    } catch {
-      print("Unable to perform the request: \(error).")
+      do {
+        try VNImageRequestHandler(data: data).perform([request])
+      } catch {
+        return ""
+      }
+
+      let observations = request.results ?? []
+      return observations
+        .compactMap { $0.topCandidates(1).first?.string }
+        .joined(separator: "\n")
+    }.value
+
+    title = recognizedText
+    return recognizedText
+  }
+
+  private var imageContents: [HistoryItemContent] {
+    contents.filter { content in
+      Self.imageTypes.contains(NSPasteboard.PasteboardType(content.type))
     }
   }
 
-  private func recognizeTextHandler(request: VNRequest, error: Error?) {
-    guard let observations = request.results as? [VNRecognizedTextObservation] else {
-      return
+  private func logicalImageSize(for content: HistoryItemContent) -> NSSize? {
+    guard let width = content.logicalWidth, let height = content.logicalHeight else {
+      return nil
+    }
+    return NSSize(width: width, height: height)
+  }
+
+  private static func makeThumbnailImage(from data: Data) -> NSImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, [
+      kCGImageSourceShouldCache: false
+    ] as CFDictionary),
+      let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: PayloadStore.thumbnailMaximumPixelSize,
+        kCGImageSourceShouldCache: false
+      ] as CFDictionary) else {
+      return nil
     }
 
-    let recognizedStrings = observations.compactMap { observation in
-      return observation.topCandidates(1).first?.string
-    }
-
-    self.title = recognizedStrings.joined(separator: "\n")
+    return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
   }
 }

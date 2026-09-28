@@ -64,7 +64,7 @@ enum ResizingMode {
 
 @Observable
 class SlideoutController {
-  let logger = Logger(label: "org.p0deje.Maccy")
+  let logger = Logger(label: "com.ryuheiyamazawa.MaccyLite")
   private static let animationDuration = 0.25
 
   let onContentResize: (CGFloat) -> Void
@@ -159,6 +159,7 @@ class SlideoutController {
     }
 
     cancelAutoOpen()
+    let itemToRelease = state.isOpen ? AppState.shared.navigator.leadHistoryItem : nil
     withAnimation(.easeInOut(duration: Self.animationDuration), completionCriteria: .removed) {
       if let window = nswindow {
         togglePreviewStateWithAnimation(windowFrame: window.frame)
@@ -187,6 +188,11 @@ class SlideoutController {
           context.completionHandler = {
             if self.state == expectedAnimationState {
               self.state = expectedAnimationState.animationDone()
+              if !self.state.isOpen {
+                Task { @MainActor in
+                  itemToRelease?.cleanupImages()
+                }
+              }
             }
           }
           context.duration = Self.animationDuration

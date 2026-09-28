@@ -42,13 +42,31 @@ Maccy works on macOS Sonoma 14 or higher.
 * Native UI
 * Open source and free
 
-## Install
+## Maccy Lite fork
 
-Download the latest version from the [releases](https://github.com/p0deje/Maccy/releases/latest) page, or use [Homebrew](https://brew.sh/):
+This fork is based on upstream Maccy master commit `c376789c5d377b7c520b6f6e91f3f3a1aa28640b`.
+It keeps Maccy's menu bar workflow and shortcuts while limiting history to 30 items (including
+up to 10 pinned items). Image originals and payloads of 64 KiB or more are stored as files;
+image thumbnails are downsampled and held in an 8 MiB bounded cache. OCR remains available on
+request and is not run automatically while copying.
+
+The fork uses bundle identifier `com.ryuheiyamazawa.MaccyLite` and stores its data under
+`~/Library/Application Support/com.ryuheiyamazawa.MaccyLite/`. It does not import or modify
+the original Maccy data directory. Build and measurement details, including known validation
+limits, are in [MEMORY-REPORT.md](MEMORY-REPORT.md).
+
+Build the macOS app with:
 
 ```sh
-brew install maccy
+xcodebuild -project Maccy.xcodeproj -scheme Maccy -configuration Release \
+  -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
 ```
+
+## Install
+
+Use the Release application in `dist/MaccyLite.app` or `dist/MaccyLite.zip`, or build this fork
+from source with the command above. The upstream [Maccy releases](https://github.com/p0deje/Maccy/releases/latest)
+and [Homebrew](https://brew.sh/) install the official Maccy application.
 
 ## Usage
 
@@ -72,7 +90,7 @@ brew install maccy
 You can tell Maccy to ignore all copied items:
 
 ```sh
-defaults write org.p0deje.Maccy ignoreEvents true # default is false
+defaults write com.ryuheiyamazawa.MaccyLite ignoreEvents true # default is false
 ```
 
 This is useful if you have some workflow for copying sensitive data. You can set `ignoreEvents` to true, copy the data and set `ignoreEvents` back to false.
@@ -110,7 +128,7 @@ By default, Maccy checks clipboard every 500 ms, which should be enough for most
 to speed it up, you can change it with `defaults`:
 
 ```sh
-defaults write org.p0deje.Maccy clipboardCheckInterval 0.1 # 100 ms
+defaults write com.ryuheiyamazawa.MaccyLite clipboardCheckInterval 0.1 # 100 ms
 ```
 
 ## FAQ
@@ -137,7 +155,7 @@ defaults write org.p0deje.Maccy clipboardCheckInterval 0.1 # 100 ms
 If for some reason it doesn't work, run the following command in Terminal.app:
 
 ```sh
-defaults write org.p0deje.Maccy showFooter 1
+defaults write com.ryuheiyamazawa.MaccyLite showFooter 1
 ```
 
 ### How to ignore copies from [Universal Clipboard](https://support.apple.com/en-us/102430)?

@@ -11,7 +11,7 @@ import SwiftData
 @Observable
 class History: ItemsContainer { // swiftlint:disable:this type_body_length
   static let shared = History()
-  let logger = Logger(label: "org.p0deje.Maccy")
+  let logger = Logger(label: "com.ryuheiyamazawa.MaccyLite")
 
   var items: [HistoryItemDecorator] = []
   var pasteStack: PasteStack?
@@ -85,6 +85,12 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     }
 
     Task {
+      for await _ in Defaults.updates(.size, initial: false) {
+        try? await load()
+      }
+    }
+
+    Task {
       for await _ in Defaults.updates(.showSpecialSymbols, initial: false) {
         for item in items {
           await updateTitle(item: item, title: item.item.generateTitle())
@@ -103,12 +109,26 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func load() async throws {
-    let descriptor = FetchDescriptor<HistoryItem>()
-    let results = try Storage.shared.context.fetch(descriptor)
+    let maximumCount = effectiveHistorySize
+    let maximumPins = min(HistoryItem.maximumPinnedItems, maximumCount)
+    _ = try Storage.shared.pruneHistory(maximumCount: maximumCount, maximumPins: maximumPins)
+
+    var pinnedDescriptor = FetchDescriptor<HistoryItem>(
+      predicate: #Predicate { $0.pin != nil },
+      sortBy: fetchSortDescriptors
+    )
+    pinnedDescriptor.fetchLimit = maximumPins
+    let pinned = try Storage.shared.context.fetch(pinnedDescriptor)
+
+    var unpinnedDescriptor = FetchDescriptor<HistoryItem>(
+      predicate: #Predicate { $0.pin == nil },
+      sortBy: fetchSortDescriptors
+    )
+    unpinnedDescriptor.fetchLimit = max(0, maximumCount - pinned.count)
+    let unpinned = try Storage.shared.context.fetch(unpinnedDescriptor)
+    let results = pinned + unpinned
     all = sorter.sort(results).map { HistoryItemDecorator($0) }
     items = all
-
-    limitHistorySize(to: Defaults[.size])
 
     updateShortcuts()
     // Ensure that panel size is proper *after* loading all items.
@@ -119,18 +139,36 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   private func limitHistorySize(to maxSize: Int) {
-    let unpinned = all.filter(\.isUnpinned)
-    if unpinned.count >= maxSize {
-      unpinned[maxSize...].forEach(delete)
+    while all.count > maxSize {
+      guard let oldest = all
+        .filter(\.isUnpinned)
+        .min(by: { $0.item.lastCopiedAt < $1.item.lastCopiedAt })
+        ?? all.min(by: { $0.item.lastCopiedAt < $1.item.lastCopiedAt }) else {
+        break
+      }
+      delete(oldest)
+    }
+  }
+
+  private var effectiveHistorySize: Int { min(max(Defaults[.size], 1), 30) }
+
+  private var fetchSortDescriptors: [SortDescriptor<HistoryItem>] {
+    switch Defaults[.sortBy] {
+    case .firstCopiedAt:
+      [SortDescriptor(\.firstCopiedAt, order: .reverse)]
+    case .numberOfCopies:
+      [SortDescriptor(\.numberOfCopies, order: .reverse)]
+    case .lastCopiedAt:
+      [SortDescriptor(\.lastCopiedAt, order: .reverse)]
     }
   }
 
   @MainActor
   func insertIntoStorage(_ item: HistoryItem) throws {
-    logger.info("Inserting item with id '\(item.title)'")
+    logger.info("Inserting a clipboard history item")
     Storage.shared.context.insert(item)
     Storage.shared.context.processPendingChanges()
-    try? Storage.shared.context.save()
+    try Storage.shared.context.save()
   }
 
   @discardableResult
@@ -145,8 +183,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     var removedItemIndex: Int?
     if let existingHistoryItem = findSimilarItem(item) {
-      if isModified(item) == nil {
-        transferContents(from: existingHistoryItem, to: item)
+      let modifiedItem = isModified(item)
+      var payloadIdentifiersToRemove = Set<String>()
+      if modifiedItem == nil {
+        payloadIdentifiersToRemove.formUnion(transferContents(from: existingHistoryItem, to: item))
       }
       item.firstCopiedAt = existingHistoryItem.firstCopiedAt
       item.numberOfCopies += existingHistoryItem.numberOfCopies
@@ -155,12 +195,19 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       if !item.fromMaccy {
         item.application = existingHistoryItem.application
       }
-      logger.info("Removing duplicate item '\(item.title)'")
+      logger.info("Removing duplicate clipboard history item")
       removedItemIndex = all.firstIndex(where: { $0.item == existingHistoryItem })
       if let removedItemIndex {
         cleanup(all[removedItemIndex])
       }
-      deleteFromStorage(existingHistoryItem)
+      payloadIdentifiersToRemove.formUnion(deleteFromStorage(existingHistoryItem))
+      Storage.shared.context.processPendingChanges()
+      do {
+        try Storage.shared.context.save()
+        payloadIdentifiersToRemove.forEach(Storage.shared.payloadStore.remove(identifier:))
+      } catch {
+        logger.error("Failed to save duplicate history cleanup: \(String(reflecting: error))")
+      }
       if let removedItemIndex {
         all.remove(at: removedItemIndex)
       }
@@ -172,7 +219,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     // Remove exceeding items. Do this after the item is added to avoid removing something
     // if a duplicate was found as then the size already stayed the same.
-    limitHistorySize(to: Defaults[.size] - 1)
+    limitHistorySize(to: effectiveHistorySize - 1)
 
     sessionLog[Clipboard.shared.changeCount] = item
 
@@ -216,6 +263,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   @MainActor
   func clear() {
     withLogging("Clearing history") {
+      let unpinnedItems = all.filter(\.isUnpinned)
+      let identifiers = Set(unpinnedItems.flatMap { $0.item.contents.compactMap(\.externalPayloadIdentifier) })
       all.forEach { item in
         if item.isUnpinned {
           cleanup(item)
@@ -225,18 +274,24 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       sessionLog.removeValues { $0.pin == nil }
       items = all
 
-      try? Storage.shared.context.transaction {
-        try? Storage.shared.context.delete(
-          model: HistoryItem.self,
-          where: #Predicate { $0.pin == nil }
-        )
-        try? Storage.shared.context.delete(
-          model: HistoryItemContent.self,
-          where: #Predicate { $0.item?.pin == nil }
-        )
+      do {
+        try Storage.shared.context.transaction {
+          try Storage.shared.context.delete(
+            model: HistoryItem.self,
+            where: #Predicate { $0.pin == nil }
+          )
+          try Storage.shared.context.delete(
+            model: HistoryItemContent.self,
+            where: #Predicate { $0.item?.pin == nil }
+          )
+        }
+        Storage.shared.context.processPendingChanges()
+        try Storage.shared.context.save()
+        identifiers.forEach(Storage.shared.payloadStore.remove(identifier:))
+        _ = try Storage.shared.reconcilePayloadFiles()
+      } catch {
+        logger.error("Failed to clear unpinned history: \(String(reflecting: error))")
       }
-      Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
     }
 
     Clipboard.shared.clear()
@@ -267,11 +322,12 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
           try context.delete(model: HistoryItem.self)
           try context.delete(model: HistoryItemContent.self)
         }
+        context.processPendingChanges()
+        try context.save()
+        _ = try Storage.shared.reconcilePayloadFiles()
       } catch {
         logger.error("Failed to clear storage: \(String(reflecting: error))")
       }
-      Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
     }
 
     Clipboard.shared.clear()
@@ -286,10 +342,16 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     guard let item else { return }
 
     cleanup(item)
+    var payloadIdentifiers = Set<String>()
     withLogging("Removing history item") {
-      deleteFromStorage(item.item)
+      payloadIdentifiers = deleteFromStorage(item.item)
       Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      do {
+        try Storage.shared.context.save()
+        payloadIdentifiers.forEach(Storage.shared.payloadStore.remove(identifier:))
+      } catch {
+        logger.error("Failed to save history item deletion: \(String(reflecting: error))")
+      }
     }
 
     all.removeAll { $0 == item }
@@ -303,21 +365,26 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   }
 
   @MainActor
-  private func transferContents(from existingItem: HistoryItem, to newItem: HistoryItem) {
-    deleteContents(of: newItem)
+  private func transferContents(from existingItem: HistoryItem, to newItem: HistoryItem) -> Set<String> {
+    let discardedIdentifiers = deleteContents(of: newItem)
     newItem.contents = existingItem.contents
     existingItem.contents = []
+    return discardedIdentifiers
   }
 
   @MainActor
-  private func deleteFromStorage(_ item: HistoryItem) {
-    deleteContents(of: item)
+  private func deleteFromStorage(_ item: HistoryItem) -> Set<String> {
+    let identifiers = deleteContents(of: item)
     Storage.shared.context.delete(item)
+    return identifiers
   }
 
   @MainActor
-  private func deleteContents(of item: HistoryItem) {
-    item.contents.forEach(Storage.shared.context.delete)
+  private func deleteContents(of item: HistoryItem) -> Set<String> {
+    let contents = item.contents
+    item.contents = []
+    contents.forEach(Storage.shared.context.delete)
+    return Set(contents.compactMap(\.externalPayloadIdentifier))
   }
 
   @MainActor
@@ -370,7 +437,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     pasteStack = stack
 
     logger.info("Initialising PasteStack with \(stack.items.count) items")
-    logger.info("Copying \(item.item.title) from PasteStack")
+    logger.info("Copying the selected clipboard item from PasteStack")
 
     if modifierFlags.isEmpty {
       AppState.shared.popup.close()
@@ -402,13 +469,13 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       return
     }
 
-    guard let pasted = stack.items.first else {
+    guard !stack.items.isEmpty else {
       pasteStack = nil
       logger.info("PasteStack is empty")
       return
     }
 
-    logger.info("PasteStack pasted \(pasted.item.title)")
+    logger.info("PasteStack pasted one clipboard item")
 
     stack.items.removeFirst()
 
@@ -418,7 +485,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       return
     }
 
-    logger.info("Copying \(item.item.title) from PasteStack. \(stack.items.count) items remaining in stack.")
+    logger.info("Copying the next clipboard item from PasteStack; \(stack.items.count) items remain")
 
     Task {
       if stack.modifierFlags.isEmpty {
@@ -449,6 +516,9 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   @MainActor
   func togglePin(_ item: HistoryItemDecorator?) {
     guard let item else { return }
+    if item.isUnpinned && pinnedItems.count >= HistoryItem.maximumPinnedItems {
+      return
+    }
 
     item.togglePin()
 

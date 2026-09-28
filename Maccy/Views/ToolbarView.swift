@@ -84,8 +84,17 @@ struct ToolbarView: View {
   }
 
   private var pinActionDisabled: Bool {
-    return appState.navigator.selection.items.contains { $0.isPinned }
-      && appState.navigator.selection.items.contains { !$0.isPinned }
+    if appState.navigator.selection.items.contains(where: \.isPinned)
+       && appState.navigator.selection.items.contains(where: \.isUnpinned) {
+      return true
+    }
+
+    if !shouldUnpin {
+      let requestedPins = appState.navigator.selection.items.filter(\.isUnpinned).count
+      return appState.history.pinnedItems.count + requestedPins > HistoryItem.maximumPinnedItems
+    }
+
+    return false
   }
 
   private var selectedImageItem: HistoryItemDecorator? {
@@ -98,15 +107,6 @@ struct ToolbarView: View {
     return item
   }
 
-  private var selectedImageText: String? {
-    guard let item = selectedImageItem else {
-      return nil
-    }
-
-    let text = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
-    return text.isEmpty ? nil : item.title
-  }
-
   var body: some View {
     HStack {
       if !appState.navigator.selection.isEmpty {
@@ -114,13 +114,18 @@ struct ToolbarView: View {
 
         if selectedImageItem != nil {
           ToolbarButton {
-            guard let selectedImageText else { return }
-            Clipboard.shared.copyInMaccy(selectedImageText)
+            guard let item = selectedImageItem else { return }
+            Task { @MainActor in
+              let existingText = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+              let text = existingText.isEmpty ? await item.item.recognizeTextOnDemand() : item.title
+              guard !text.isEmpty else { return }
+              Clipboard.shared.copyInMaccy(text)
+            }
           } label: {
             Image(systemName: "text.viewfinder")
           }
           .shortcutKeyHelp(key: "CopyExtractedText", tableName: "PreviewItemView")
-          .disabled(selectedImageText == nil)
+          .disabled(selectedImageItem == nil)
         }
 
         ToolbarButton {

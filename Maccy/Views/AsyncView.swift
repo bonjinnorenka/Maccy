@@ -36,6 +36,12 @@ struct AsyncView<Value, Content: View, Placeholder: View>: View {
       }
     }
     .id(id)
+    .onDisappear {
+      // A loaded value can hold a decoded, full-resolution image. Releasing
+      // this state is necessary because SwiftUI may keep the child state alive
+      // briefly after the preview branch has been removed.
+      viewState = .loading
+    }
     .task(id: id) {
       do {
         viewState = .loading

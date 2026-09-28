@@ -247,7 +247,7 @@ class HistoryTests: XCTestCase { // swiftlint:disable:this type_body_length
     try assertStorageCounts(items: 10, contents: 10)
   }
 
-  func testMaxSizeIgnoresPinned() {
+  func testMaxSizeIncludesPinnedItems() {
     var items: [HistoryItemDecorator] = []
 
     let item = history.add(historyItem("0"))
@@ -258,10 +258,58 @@ class HistoryTests: XCTestCase { // swiftlint:disable:this type_body_length
       items.append(history.add(historyItem(String(index))))
     }
 
-    XCTAssertEqual(history.items.count, 11)
+    XCTAssertEqual(history.items.count, 10)
     XCTAssertTrue(history.items.contains(items[10]))
     XCTAssertTrue(history.items.contains(items[0]))
     XCTAssertFalse(history.items.contains(items[1]))
+  }
+
+  func testHistoryKeepsTheNewestThirtyAndDeletesTheirContents() throws {
+    Defaults[.size] = 30
+    let pinned = history.add(historyItem("pinned"))
+    history.togglePin(pinned)
+
+    var items: [HistoryItemDecorator] = []
+    for index in 0..<35 {
+      items.append(history.add(historyItem("entry-\(index)")))
+    }
+
+    XCTAssertEqual(history.all.count, 30)
+    XCTAssertTrue(history.all.contains(pinned))
+    XCTAssertFalse(history.all.contains(items[0]))
+    XCTAssertTrue(history.all.contains(items[34]))
+    try assertStorageCounts(items: 30, contents: 30)
+  }
+
+  func testHundredUpdatesLeaveNoOrphanedPayloadFiles() throws {
+    Defaults[.size] = 30
+    for index in 0..<120 {
+      let text = String(repeating: String(index % 10), count: 65_535) + String(index)
+      history.add(historyItem(text))
+    }
+
+    XCTAssertEqual(history.all.count, 30)
+    try assertStorageCounts(items: 30, contents: 30)
+    XCTAssertEqual(try Storage.shared.reconcilePayloadFiles(), 0)
+
+    let payloadDirectories = try FileManager.default.contentsOfDirectory(
+      at: Storage.shared.payloadStore.rootURL,
+      includingPropertiesForKeys: nil
+    ).filter { UUID(uuidString: $0.lastPathComponent) != nil }
+    XCTAssertEqual(payloadDirectories.count, 30)
+  }
+
+  func testPinLimitIsTen() {
+    Defaults[.size] = 30
+    let items = (0..<11).map { history.add(historyItem("pin-\($0)")) }
+
+    for item in items {
+      history.togglePin(item)
+    }
+
+    XCTAssertEqual(history.pinnedItems.count, HistoryItem.maximumPinnedItems)
+    XCTAssertFalse(items[10].isPinned)
+    XCTAssertEqual(HistoryItem.availablePins(in: history.pinnedItems.map(\.item)), [])
   }
 
   func testMaxSizeIsChanged() {
@@ -312,6 +360,29 @@ class HistoryTests: XCTestCase { // swiftlint:disable:this type_body_length
     history.delete(foo)
     XCTAssertEqual(history.items, [bar])
     try assertStorageCounts(items: 1, contents: 1)
+  }
+
+  func testDeletingAnImageDeletesItsPayloadFiles() throws {
+    let imageURL = Bundle(for: type(of: self)).url(forResource: "guy", withExtension: "jpeg")!
+    let content = HistoryItemContent(
+      type: NSPasteboard.PasteboardType.jpeg.rawValue,
+      value: try Data(contentsOf: imageURL)
+    )
+    let item = HistoryItem(contents: [content])
+    Storage.shared.context.insert(item)
+    let decorator = history.add(item)
+    let identifier = try XCTUnwrap(content.externalPayloadIdentifier)
+    let originalURL = Storage.shared.payloadStore.originalURL(for: identifier, type: content.type)
+    let thumbnailURL = Storage.shared.payloadStore.previewURL(for: identifier)
+
+    XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: thumbnailURL.path))
+
+    history.delete(decorator)
+
+    XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: thumbnailURL.path))
+    try assertStorageCounts(items: 0, contents: 0)
   }
 
   func testCleaningUpOrphanedContents() throws {

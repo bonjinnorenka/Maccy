@@ -223,6 +223,22 @@ class ClipboardTests: XCTestCase {
   }
 
   @MainActor
+  func testCopyPreservesAllImageRepresentations() throws {
+    let tiffData = try XCTUnwrap(image.tiffRepresentation)
+    let bitmap = try XCTUnwrap(NSBitmapImageRep(data: tiffData))
+    let pngData = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+    let item = HistoryItem(contents: [
+      HistoryItemContent(type: tiffType.rawValue, value: tiffData),
+      HistoryItemContent(type: NSPasteboard.PasteboardType.png.rawValue, value: pngData)
+    ])
+
+    clipboard.copy(item)
+
+    XCTAssertEqual(pasteboard.data(forType: .tiff), tiffData)
+    XCTAssertEqual(pasteboard.data(forType: .png), pngData)
+  }
+
+  @MainActor
   func testCopyString() {
     clipboard.copyInMaccy("foo")
     XCTAssertEqual(pasteboard.string(forType: .string), "foo")

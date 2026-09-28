@@ -13,7 +13,7 @@ struct StorageType {
 extension Defaults.Keys {
 #if DEBUG
   // UI Tests bundle preferences
-  static let testingSuiteName = "\(Bundle.main.bundleIdentifier ?? "org.p0deje.Maccy").uitests"
+  static let testingSuiteName = "\(Bundle.main.bundleIdentifier ?? "com.ryuheiyamazawa.MaccyLite").uitests"
 
   // When UI tests run with the `enable-testing` argument, window and pin
   // preferences are stored in a separate xcuitest bundle
@@ -67,7 +67,7 @@ extension Defaults.Keys {
   static let searchVisibility = Key<SearchVisibility>("searchVisibility", default: .always, suite: preferencesSuite)
   static let showSpecialSymbols = Key<Bool>("showSpecialSymbols", default: true, suite: preferencesSuite)
   static let showTitle = Key<Bool>("showTitle", default: true, suite: preferencesSuite)
-  static let size = Key<Int>("historySize", default: 200, suite: preferencesSuite)
+  static let size = Key<Int>("historySize", default: 30, suite: preferencesSuite)
   static let sortBy = Key<Sorter.By>("sortBy", default: .lastCopiedAt, suite: preferencesSuite)
   static let suppressClearAlert = Key<Bool>("suppressClearAlert", default: false, suite: preferencesSuite)
   static let windowSize = Key<NSSize>("windowSize", default: NSSize(width: 450, height: 800), suite: preferencesSuite)

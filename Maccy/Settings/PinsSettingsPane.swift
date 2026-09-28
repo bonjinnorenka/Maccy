@@ -38,6 +38,7 @@ struct PinValueView: View {
   @State private var isRichText: Bool
   @FocusState private var isEditing: Bool
   @State private var showWarningPopover: Bool = false
+  @Environment(\.modelContext) private var modelContext
 
   init(item: HistoryItem) {
     self.item = item
@@ -45,7 +46,7 @@ struct PinValueView: View {
 
     // Check if this item has editable text content
     let hasPlainText = item.text != nil
-    let hasImage = item.image != nil
+    let hasImage = item.hasImage
     let hasFileURLs = !item.fileURLs.isEmpty
     let hasRichText = item.rtf != nil || item.html != nil
 
@@ -94,20 +95,31 @@ struct PinValueView: View {
     // Only update if we're dealing with text or rich text content
     guard isTextContent || isRichText else { return }
 
-    // Remove all non-plain-text content
     let stringType = NSPasteboard.PasteboardType.string.rawValue
+    let removedContents = item.contents.filter { $0.type != stringType }
+    let identifiersToRemove = Set(removedContents.compactMap(\.externalPayloadIdentifier))
+    removedContents.forEach(modelContext.delete)
     item.contents.removeAll { $0.type != stringType }
 
-    // Update or add the plain text content
+    var replacedIdentifier: String?
     if let index = item.contents.firstIndex(where: { $0.type == stringType }) {
       if let data = editableValue.data(using: .utf8) {
-        item.contents[index].value = data
+        replacedIdentifier = try? item.contents[index].replacePayload(with: data)
       }
     } else {
       if let data = editableValue.data(using: .utf8) {
         let newContent = HistoryItemContent(type: stringType, value: data)
         item.contents.append(newContent)
       }
+    }
+
+    do {
+      try modelContext.save()
+      for identifier in identifiersToRemove.union(replacedIdentifier.map { [$0] } ?? []) {
+        PayloadStore.shared.remove(identifier: identifier)
+      }
+    } catch {
+      // The next startup reconciliation retries file cleanup after a successful save.
     }
     // We don't automatically update title here since we want to preserve
     // OCR-extracted titles for images and other non-text content

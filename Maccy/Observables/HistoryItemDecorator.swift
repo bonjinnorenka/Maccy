@@ -11,6 +11,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   }
 
   static var previewImageSize: NSSize { NSScreen.forPopup?.visibleFrame.size ?? NSSize(width: 2048, height: 1536) }
+  static let maximumPreviewPixelSize = 2_048
   static var thumbnailImageSize: NSSize { NSSize(width: 340, height: Defaults[.imageMaxHeight]) }
 
   let id = UUID()
@@ -39,15 +40,19 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
     return url.deletingPathExtension().lastPathComponent
   }
 
-  var hasImage: Bool { item.image != nil }
+  var hasImage: Bool { item.hasImage }
 
   var previewImageGenerationTask: Task<(), Error>?
   var thumbnailImageGenerationTask: Task<(), Error>?
   var previewImage: NSImage?
+  private(set) var thumbnailGeneration: UInt64 = 0
   var previewText: String {
     item.previewableText
   }
-  var thumbnailImage: NSImage?
+  var thumbnailImage: NSImage? {
+    _ = thumbnailGeneration
+    return item.thumbnailImage(maximumSize: HistoryItemDecorator.thumbnailImageSize)
+  }
   var applicationImage: ApplicationImage
 
   // 10k characters seems to be more than enough on large displays
@@ -75,8 +80,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   // Describe the complete item independently of its potentially truncated visual content.
   var accessibilityLabel: String {
     var parts: [String] = []
-    if hasImage, let image = item.image {
-      let size = image.pixelSize
+    if hasImage, let size = item.imagePixelSize {
       parts.append(String(format: NSLocalizedString("history_item_image_accessibility_label_no_app", comment: ""), Int(size.width), Int(size.height)))
     } else {
       parts.append(title)
@@ -105,23 +109,22 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
 
   @MainActor
   func ensureThumbnailImage() {
-    guard item.image != nil else {
-      return
-    }
-    guard thumbnailImage == nil else {
+    guard item.hasImage else {
       return
     }
     guard thumbnailImageGenerationTask == nil else {
       return
     }
     thumbnailImageGenerationTask = Task { [weak self] in
-      self?.generateThumbnailImage()
+      guard let self else { return }
+      _ = self.item.thumbnailImage(maximumSize: HistoryItemDecorator.thumbnailImageSize)
+      self.thumbnailGeneration &+= 1
     }
   }
 
   @MainActor
   func ensurePreviewImage() {
-    guard item.image != nil else {
+    guard item.hasImage else {
       return
     }
     guard previewImage == nil else {
@@ -149,33 +152,28 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   func cleanupImages() {
     thumbnailImageGenerationTask?.cancel()
     previewImageGenerationTask?.cancel()
-    thumbnailImage?.recache()
-    previewImage?.recache()
-    thumbnailImage = nil
     previewImage = nil
-    item.clearDecodedImageCache()
-  }
-
-  @MainActor
-  private func generateThumbnailImage() {
-    guard let image = item.image else {
-      return
-    }
-    thumbnailImage = image.resized(to: HistoryItemDecorator.thumbnailImageSize)
+    thumbnailImageGenerationTask = nil
+    previewImageGenerationTask = nil
   }
 
   @MainActor
   private func generatePreviewImage() {
-    guard let image = item.image else {
+    guard item.hasImage else {
       return
     }
-    previewImage = image.resized(to: HistoryItemDecorator.previewImageSize)
+    let scale = NSScreen.forPopup?.backingScaleFactor ?? 2
+    let maxDimension = HistoryItemDecorator.previewImageSize
+    let screenPixelSize = Int(max(maxDimension.width, maxDimension.height) * scale)
+    previewImage = item.previewImage(
+      maximumPixelSize: min(screenPixelSize, Self.maximumPreviewPixelSize)
+    )
   }
 
   @MainActor
   func sizeImages() {
     generatePreviewImage()
-    generateThumbnailImage()
+    _ = item.thumbnailImage(maximumSize: HistoryItemDecorator.thumbnailImageSize)
   }
 
   func highlight(_ query: String, _ ranges: [Range<String.Index>]) {
